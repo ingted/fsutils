@@ -33,6 +33,18 @@ module Rop =
         | Some x -> Success x
         | None -> Failure failMessage
 
+    let private invokeCps onFail onSuccess func =
+        try
+            () |> func |> onSuccess 
+        with ex ->
+            ex |> onFail
+
+    let invoke onFail func = 
+        func |> invokeCps (onFail >> Failure) Success
+
+    let invokeBind onFail func = 
+        func |> invokeCps (onFail >> Failure) id
+
     let (<!>) o f = map f o
     let (>>=) o f = bind f o
     let (>=>) = compose

@@ -11,39 +11,52 @@ open Rop
 open Microsoft.SqlServer.Management.Smo
 
 module Internal =
+    module FailMessage =
+        open System
+
+        let noDatabaseFound server database =
+            sprintf "Threre is no database '%s' on server '%s'" database server
+
+        let generic (ex:Exception) =
+            sprintf "Failed - %s" (ex.ToString())
+
+        let cantFindServer server (ex:Exception) = 
+            sprintf "Can't find server '%s': %s" server (ex.ToString())
+
+        let cantFindDatabase server database (ex:Exception) =
+            sprintf "Can't find database '%s' on server '%s' - %s" database server (ex.ToString())
+
+        let cantRestoreDatabase server database (ex:Exception) =
+            sprintf "Can't restore database '%s' on server '%s' - %s" database server (ex.ToString())
+
+        let cantCreateDatabase server database (ex:Exception) =
+            sprintf "Can't create database '%s' on server '%s' - %s" database server (ex.ToString())
+
+        let cantDropDatabase server database (ex:Exception) =
+            sprintf "Can't drop database '%s' on server '%s' - %s" database server (ex.ToString())
+
     let findServer (serverName:string) =
-        try
-            Success (Server serverName)
-        with ex -> 
-            Failure (sprintf "Can't find server '%s': %s" serverName (ex.ToString()))
+        Rop.invoke (FailMessage.cantFindServer serverName) <| fun _ -> 
+            Server serverName
 
     let findDatabase databaseName (server:Server) =
-        rop {
-            let database = 
-                server.Databases
-                |> Seq.cast<Database> 
-                |> Seq.tryFind (fun db -> System.String.Compare (db.Name, databaseName, ignoreCase=true) = 0)
-                |> Rop.ofOption (sprintf "Can't find database '%s' on server '%s'" databaseName server.Name)
-
-            return! database }
+        Rop.invokeBind (FailMessage.cantFindDatabase server.Name databaseName) <| fun _ ->
+            server.Databases
+            |> Seq.cast<Database> 
+            |> Seq.tryFind (fun db -> System.String.Compare (db.Name, databaseName, ignoreCase=true) = 0)
+            |> Rop.ofOption (FailMessage.noDatabaseFound server.Name databaseName)
 
     let restore progress bakupPath (server:Server) (database:Database) = 
-        try
+        Rop.invoke (FailMessage.cantRestoreDatabase server.Name database.Name) <| fun _ ->
+            server.KillAllProcesses database.Name
             let restore = Restore ()
             restore.ReplaceDatabase <- true
             restore.Action <- RestoreActionType.Database
             restore.Database <- database.Name
             restore.Devices.AddDevice (bakupPath, DeviceType.File)
-
-            server.KillAllProcesses database.Name
-
             restore.PercentComplete.Add (fun e -> e.Percent |> progress)
             restore.SqlRestore server
             restore.Wait ()
-
-            Success ()
-        with ex ->
-            Failure (sprintf "Failed to restore the database '%s' on server '%s': %s" database.Name server.Name (ex.ToString()))
 
     let restoreDatabase progress (backupPath:string) (serverName:string) (databaseName:string) =
         rop {
@@ -51,17 +64,37 @@ module Internal =
             let! database = server |> findDatabase databaseName
 
             return restore progress backupPath server database |> ignore } 
-            
-let private printRestorePercent percent = if percent % 10 = 0 then printfn "Restored %d%%" percent
-let private restoreWithProgress = Internal.restoreDatabase printRestorePercent
 
-let restoreDatabase backupPath serverName databaseName =
-    printfn "Starting '%s' database restore on '%s' server from '%s'" databaseName serverName backupPath
+module Database =
+    open Internal
 
-    restoreWithProgress backupPath serverName databaseName
-    |> function
-        | Success _ -> printfn "Successfuly restored database"
-        | Failure msg -> printfn "Failed to restor the database: %s" msg
+    let private printRestorePercent percent = if percent % 10 = 0 then printfn "Restored %d%%" percent
+    let private restoreWithProgress = restoreDatabase printRestorePercent
+    let private createDatabase name server = Database (server,name) |> fun d -> d.Create ()
+    let private dropDatabase name server = Database (server,name) |> fun d -> d.Drop ()
 
-let createDatabase serverName databaseName =
-    ()
+    let restore backupPath serverName databaseName =
+        printfn "Starting '%s' database restore on '%s' server from '%s'" databaseName serverName backupPath
+
+        restoreWithProgress backupPath serverName databaseName
+        |> function
+            | Success _ -> printfn "Successfuly restored database"
+            | Failure msg -> printfn "Failed to restore the database: %s" msg
+
+    let create serverName databaseName =
+        printfn "Creating database '%s' on '%s' server" databaseName serverName
+
+        Rop.invokeBind (FailMessage.cantCreateDatabase serverName databaseName) <| fun _ -> 
+            findServer serverName <!> createDatabase databaseName
+        |> function
+            | Success _ -> printfn "Successfuly created database"
+            | Failure msg -> printfn "Failed to create database: %s" msg
+
+    let drop serverName databaseName =
+        printfn "Dropping database '%s' on '%s' server" databaseName serverName
+
+        Rop.invokeBind (FailMessage.cantDropDatabase serverName databaseName) <| fun _ ->
+            findServer serverName <!> dropDatabase databaseName
+        |> function
+            | Success _ -> printfn "Successfuly dropped database"
+            | Failure msg -> printfn "Failed to drop database: %s" msg
