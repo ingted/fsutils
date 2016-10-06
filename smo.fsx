@@ -63,15 +63,13 @@ module Internal =
             let! server = findServer serverName
             let! database = server |> findDatabase databaseName
 
-            return restore progress backupPath server database |> ignore } 
+            return! restore progress backupPath server database } 
 
 module Database =
     open Internal
 
     let private printRestorePercent percent = if percent % 10 = 0 then printfn "Restored %d%%" percent
     let private restoreWithProgress = restoreDatabase printRestorePercent
-    let private createDatabase name server = Database (server,name) |> fun d -> d.Create ()
-    let private dropDatabase name server = Database (server,name) |> fun d -> d.Drop ()
 
     let restore backupPath serverName databaseName =
         printfn "Starting '%s' database restore on '%s' server from '%s'" databaseName serverName backupPath
@@ -85,7 +83,7 @@ module Database =
         printfn "Creating database '%s' on '%s' server" databaseName serverName
 
         Rop.invokeBind (FailMessage.cantCreateDatabase serverName databaseName) <| fun _ -> 
-            findServer serverName <!> createDatabase databaseName
+            findServer serverName <!> fun server -> (Database (server,databaseName)).Create ()
         |> function
             | Success _ -> printfn "Successfuly created database"
             | Failure msg -> printfn "Failed to create database: %s" msg
@@ -94,7 +92,10 @@ module Database =
         printfn "Dropping database '%s' on '%s' server" databaseName serverName
 
         Rop.invokeBind (FailMessage.cantDropDatabase serverName databaseName) <| fun _ ->
-            findServer serverName <!> dropDatabase databaseName
+            rop {
+                let! server = findServer serverName
+                let! database = server |> findDatabase databaseName
+                return () |> database.Drop |> ignore }
         |> function
             | Success _ -> printfn "Successfuly dropped database"
             | Failure msg -> printfn "Failed to drop database: %s" msg
