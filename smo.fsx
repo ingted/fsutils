@@ -3,6 +3,7 @@
 #r "Microsoft.SqlServer.ConnectionInfo.dll"
 #r "Microsoft.SqlServer.SmoExtended.dll"
 #r "Microsoft.SqlServer.Management.Sdk.Sfc.dll"
+#r "System.Data"
 
 #load "rop.fsx"
 
@@ -11,11 +12,38 @@ open Rop
 open Microsoft.SqlServer.Management.Smo
 
 module Internal =
+    open System.Data
+    open System.IO
+
+    let private (</>) x y = Path.Combine (x,y)
+    let private findColumn failMessage name (columns:DataColumn seq) = 
+        columns 
+        |> Seq.tryFind (fun c -> System.String.Compare (c.ColumnName,name,ignoreCase=true) = 0)
+        |> Rop.ofOption (failMessage name)
+
     module FailMessage =
         open System
 
         let noDatabaseFound server database =
             sprintf "Threre is no database '%s' on server '%s'" database server
+
+        let noColumnInBackupFileList backupPath columnName =
+            sprintf "There is no column '%s' in filelist table of backup files '%s'" columnName backupPath
+
+        let noDefaultFileGroupFound database = 
+            sprintf "There is no default file group in database '%s'" database
+
+        let noFilesInFileGroup fileGroup =
+            sprintf "There are no files in file group '%s'" fileGroup
+
+        let noPrimaryDataFile fileGroup = 
+            sprintf "There is no primary data file in file group '%s'" fileGroup
+
+        let noDataFileInBackup backup =
+            sprintf "There is no data file in backup '%s'" backup
+
+        let noLogFileInBackup backup =
+            sprintf "There is no log file in backup '%s'" backup
 
         let generic (ex:Exception) =
             sprintf "Failed - %s" (ex.ToString())
@@ -47,16 +75,66 @@ module Internal =
             |> Rop.ofOption (FailMessage.noDatabaseFound server.Name databaseName)
 
     let restore progress bakupPath (server:Server) (database:Database) = 
-        Rop.invoke (FailMessage.cantRestoreDatabase server.Name database.Name) <| fun _ ->
+        Rop.invokeBind (FailMessage.cantRestoreDatabase server.Name database.Name) <| fun _ ->
             server.KillAllProcesses database.Name
+
             let restore = Restore ()
             restore.ReplaceDatabase <- true
             restore.Action <- RestoreActionType.Database
             restore.Database <- database.Name
             restore.Devices.AddDevice (bakupPath, DeviceType.File)
-            restore.PercentComplete.Add (fun e -> e.Percent |> progress)
-            restore.SqlRestore server
-            restore.Wait ()
+
+            let files   = server |> restore.ReadFileList
+            let columns = files.Columns |> Seq.cast<DataColumn>
+            let rows    = files.Rows |> Seq.cast<DataRow>
+
+            let cantFindColumn = FailMessage.noColumnInBackupFileList bakupPath
+            let getColumn = findColumn cantFindColumn
+
+            let relocateFiles = 
+                rop {
+                    let! colLogicalName = columns |> getColumn "LogicalName"
+                    let! colType = columns |> getColumn "Type"
+
+                    let! dataFileLogicalName = 
+                        rows 
+                        |> Seq.tryFind (fun row -> row.[colType].ToString () = "D")
+                        |> Rop.ofOption (FailMessage.noDataFileInBackup bakupPath)
+                        <!> fun row -> row.[colLogicalName].ToString ()
+
+                    let! logFileLogicalName =
+                        rows
+                        |> Seq.tryFind (fun row -> row.[colType].ToString () = "L")
+                        |> Rop.ofOption (FailMessage.noLogFileInBackup bakupPath)
+                        <!> fun row -> row.[colLogicalName].ToString ()
+
+                    let! defaultFileGroup = 
+                        database.FileGroups 
+                        |> Seq.cast<FileGroup>
+                        |> Seq.tryFind (fun fg -> fg.IsDefault) 
+                        |> Rop.ofOption (FailMessage.noDefaultFileGroupFound database.Name)
+
+                    let! primaryFile = 
+                        if defaultFileGroup.Files.Count = 0 
+                        then Failure (FailMessage.noFilesInFileGroup defaultFileGroup.Name)
+                        else Success defaultFileGroup.Files
+                        >>= (fun files -> 
+                            files 
+                            |> Seq.cast<DataFile> 
+                            |> Seq.tryFind (fun f -> f.IsPrimaryFile)
+                            |> Rop.ofOption (FailMessage.noPrimaryDataFile defaultFileGroup.Name))
+                        
+                    let dataFilePath = server.DefaultFile </> (primaryFile.FileName |> Path.GetFileName)
+                    let logFilePath  = server.DefaultLog  </> (sprintf "%s_log.ldf" (dataFilePath |> Path.GetFileNameWithoutExtension))
+
+                    return [ dataFileLogicalName,dataFilePath; logFileLogicalName,logFilePath ] |> List.map RelocateFile }
+
+            relocateFiles
+            <!> (fun fs -> 
+                fs |> List.map restore.RelocateFiles.Add |> ignore
+                restore.PercentComplete.Add (fun e -> e.Percent |> progress)
+                restore.SqlRestore server
+                restore.Wait ()  |> ignore )
 
     let restoreDatabase progress (backupPath:string) (serverName:string) (databaseName:string) =
         rop {
