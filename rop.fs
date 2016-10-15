@@ -1,5 +1,5 @@
 [<AutoOpen>]
-module Rop =
+module Rop
     type Result<'TEntity> =
         | Success of 'TEntity
         | Failure of string
