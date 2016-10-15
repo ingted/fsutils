@@ -5,7 +5,7 @@
 #r "Microsoft.SqlServer.Management.Sdk.Sfc.dll"
 #r "System.Data"
 
-#load "rop.fsx"
+#load "rop.fs"
 
 open Rop
 
