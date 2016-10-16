@@ -1,4 +1,3 @@
-[<AutoOpen>]
 module Rop
     type Result<'TEntity> =
         | Success of 'TEntity
